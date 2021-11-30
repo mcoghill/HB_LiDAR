@@ -1,0 +1,33 @@
+---
+title: "01_Download"
+author: "Matthew Coghill"
+date: "11/30/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This document will be used to access the appropriate LAS files that are held in the Google Drive folder.
+
+```{r}
+
+# Load libraries
+library(googledrive)
+
+```
+
+Now, we can download the file(s) to our specified directory
+
+```{r}
+
+drive <- file.path() # 
+drive_las <- file.path()
+dl_dir <- file.path("./01_download_raw")
+dir.create(dl_dir, showWarnings = FALSE)
+
+drive_download(drive_las, dl_dir)
+
+```
+

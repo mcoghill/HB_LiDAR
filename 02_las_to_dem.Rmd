@@ -1,0 +1,21 @@
+---
+title: "02_las_to_dem"
+author: "Matthew Coghill"
+date: "11/30/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+The primary purpose of this file will be to process the downloaded LAS files into raster products.
+
+```{r}
+# ☻
+
+library(tidyverse)
+library(lidR)
+
+```
+
