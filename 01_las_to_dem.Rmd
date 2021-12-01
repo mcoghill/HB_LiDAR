@@ -16,6 +16,128 @@ The primary purpose of this file will be to process the downloaded LAS files int
 
 library(tidyverse)
 library(lidR)
+library(future)
+
+```
+
+Get directories and load the las file as a catalogue
+
+```{r}
+
+dl_dir <- file.path("./01_download_raw")
+las_file <- readLAScatalog(dl_dir)
+tile_dir <- file.path("./02_tile")
+prod_dir <- file.path("./outputs")
+dir.create(tile_dir, showWarnings = FALSE)
+dir.create(prod_dir, showWarnings = FALSE)
+
+# Perform tiling
+plan(multisession)
+set_lidr_threads(1)
+
+# Catalog processing options
+opt_chunk_buffer(las_file) <- 0
+opt_chunk_size(las_file) <- 250
+opt_output_files(las_file) <- file.path(tile_dir, "{XLEFT}_{YBOTTOM}")
+opt_chunk_alignment(las_file) <- c(
+  plyr::round_any(xmin(las_file), 10, floor),
+  plyr::round_any(ymin(las_file), 10, floor))
+
+ctg <- catalog_retile(las_file)
+ctg <- readLAScatalog(tile_dir)
+lidR:::catalog_laxindex(ctg)
+
+```
+
+Some point classification has been done but I am not thoroughly satisfied with ground point classification. Reclassify ground points here:
+
+```{r}
+
+# Create function
+ctg_fn <- function(las) {
+  las <- readLAS(las)
+  if (is.empty(las)) return(NULL)  
+  l1 <- filter_poi(las, !Classification %in% c(0L, 2L))
+  l2 <- filter_poi(las, Classification %in% c(0L, 2L))
+  l2$Classification <- 0L
+  l2 <- classify_ground(l2, algorithm = csf())
+  las <- rbind(l1, l2)
+  las <- filter_poi(las, buffer == 0)
+  return(las)
+}
+
+class_out <- file.path("./02a_classified")
+dir.create(class_out, showWarnings = FALSE)
+
+opt_chunk_buffer(ctg) <- 10
+opt_output_files(ctg) <- file.path(class_out, "{*}")
+
+# Function is a memory hog, use only half the amount of cores to limit number
+# of tiles loaded in at once
+plan(multisession(workers = availableCores()/2))
+set_lidr_threads(1)
+ctg_cls <- catalog_apply(ctg, ctg_fn, .options = list(automerge = TRUE))
+plan(multisession)
+lidR:::catalog_laxindex(ctg_cls)
+
+```
+
+Digital terrain/elevation model (DTM/DEM) generation: use tin algorithm. Luckily, the points are already classified and noise has been removed, so we can just run the algorithm!
+
+```{r}
+
+rast_out <- file.path("./03_dem_tiles")
+dir.create(rast_out, showWarnings = FALSE)
+
+# Set catalog options
+opt_chunk_buffer(ctg_cls) <- 10
+opt_output_files(ctg_cls) <- file.path(rast_out, "{*}_dem")
+
+# Create function so that the output is not a large raster file
+set_lidr_threads(1)
+plan(multisession(workers = availableCores()/2))
+dem_5cm <- grid_terrain(ctg_cls, res = 0.05, algorithm = tin())
+plan(sequential)
+writeRaster(dem_5cm, file.path(prod_dir, "dem_5cm.tif"), overwrite = TRUE)
+
+```
+
+For DSM, we need normalized LAS files
+
+```{r}
+
+norm_dir <- file.path("./04_normalized")
+dir.create(norm_dir, showWarnings = FALSE)
+
+ctg_cls <- readLAScatalog(class_out)
+opt_chunk_buffer(ctg_cls) <- 10
+opt_output_files(ctg_cls) <- file.path(norm_dir, "{*}")
+
+plan(multisession(workers = availableCores()/2))
+ctg_norm <- normalize_height(ctg_cls, algorithm = tin(), Wdegenerated = FALSE)
+
+```
+
+Now, create DSM
+
+```{r}
+
+ctg_norm <- readLAScatalog(norm_dir, filter = "-drop_z_below 0")
+sq <- c(0, 2, seq(5, plyr::round_any(ctg_norm$Max.Z, 5, ceiling), 5))
+
+rast_out <- file.path("./05_dsm_tiles")
+dir.create(rast_out, showWarnings = FALSE)
+
+# Set catalog options
+opt_chunk_buffer(ctg_norm) <- 10
+opt_output_files(ctg_norm) <- file.path(rast_out, "{*}_dsm")
+
+# Create function so that the output is not a large raster file
+set_lidr_threads(1)
+plan(multisession(workers = availableCores()/2))
+dsm_5cm <- grid_canopy(ctg_norm, res = 0.05, algorithm = pitfree(sq, c(0, 1), subcircle = 0.025))
+plan(sequential)
+writeRaster(dsm_5cm, file.path(prod_dir, "dsm_5cm.tif"), overwrite = TRUE)
 
 ```
 

@@ -39,3 +39,5 @@ rsconnect/
 *.las
 *.laz
 *.lax
+*.tif
+*.vrt
