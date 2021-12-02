@@ -1,5 +1,5 @@
 ---
-title: "02_las_to_dem"
+title: "01_las_to_dem"
 author: "Matthew Coghill"
 date: "11/30/2021"
 output: html_document
@@ -9,22 +9,40 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-The primary purpose of this file will be to process the downloaded LAS files into raster products.
+The primary purpose of this file will be to process the downloaded LAS file into raster products (DEM and DSM). First, core libraries need to be loaded. We will also define our output map resolution here in meters.
 
-```{r}
-# ☻
+```{r Load Libraries}
 
 library(tidyverse)
 library(lidR)
 library(future)
 library(terra)
 
+# Define desired resolution of the output map in meters
+map_res <- 0.05
+
+# Create text string for file outputs
+res_txt <- if(map_res >= 1) {
+  paste0("_", map_res, "m")
+} else {
+  paste0("_", map_res * 100, "cm")
+}
+
 ```
 
-Get directories and load the las file as a catalogue
+The first thing that needs to happen is tiling. The LAS file that I received was very large and difficult to work with on most machines. Tiling gets around that by breaking the large LAS file into many (36) smaller tiles. This helps to manage memory and increases efficiency since we can get machine cores working on each tile. If your machine has 16 cores, you can get a maximum of 16 tiles loaded and processed at once, but make sure to work within the limits of your machine since individual user experience will vary.
 
-```{r}
+The flow of this chunk is as follows:
+1. Define input and output directories. Create those if necessary.
+2. Use all cores of the machine to derive tiles from the original LAS file
+3. Define options for how the tiling will be performed, as well as output locations
+4. Perform tiling, when finished perform indexing by creating .lax files
 
+Tests to be completed: does `readLASUAVcatalog()` improve anything for any of the functions?
+
+```{r Tiling}
+
+# Define directories
 dl_dir <- file.path("./01_download_raw")
 las_file <- readLAScatalog(dl_dir)
 tile_dir <- file.path("./02_tile")
@@ -32,9 +50,9 @@ prod_dir <- file.path("./outputs")
 dir.create(tile_dir, showWarnings = FALSE)
 dir.create(prod_dir, showWarnings = FALSE)
 
-# Perform tiling
-plan(multisession)
+# Set up machine cores for tiling
 set_lidr_threads(1)
+plan(multisession)
 
 # Catalog processing options
 opt_chunk_buffer(las_file) <- 0
@@ -44,18 +62,31 @@ opt_chunk_alignment(las_file) <- c(
   plyr::round_any(xmin(las_file), 10, floor),
   plyr::round_any(ymin(las_file), 10, floor))
 
+# Perform tiling
 ctg <- catalog_retile(las_file)
 ctg <- readLAScatalog(tile_dir)
 lidR:::catalog_laxindex(ctg)
 
 ```
 
-Some point classification has been done but I am not thoroughly satisfied with ground point classification. Reclassify ground points here:
+The original LAS file came with some amount of classification completed, but ground point classification was not effectively done. I found this by creating and examining a DEM which had some rough points in some areas - the file itself is the result of merging 3 files together, so I'm not surprised that there were some issues. Ultimately, this requires ground point classification at this stage, but I don't want to interfere with the points already classified (not ground points), I just want to classify those that have already been ground classified and points that are unclassified, i.e.: point classifications 0 and 2. After classifying those points, they will be merged back together with the other classified points to recreate the full point cloud. This exercise assumes that the data has already been cleaned (confirmed by Richard).
 
-```{r}
+The overall steps include:
 
-# Create function
-ctg_fn <- function(las) {
+1. Load in a LAS tile
+2. Separate the points that are classified as NOT 0's and 2's from the LAS tile (l1)
+3. Separate the points that are classified as 0's and 2's (l2)
+4. Reclassify all values in l2 to 0 (unclassified)
+5. Perform ground point classification on l2 using the cloth simulated filter (CSF)
+6. Merge l1 and l2 back together
+7. Save these tiles to a new folder
+
+I completed this using `lidR`'s catalog_apply() function application. This allows everything to be done efficiently in memory; however in doing so it becomes a memory hog on your machine. Monitor task manager and expect this to majorly impact usability on your PC while this and any other functions run. Other ways to do this include creating and saving separate LAS tiles for each step in this process, though this will eat up a lot of storage on your machine and will likely cost some amount of time for loading/saving each tile.
+
+```{r Reclassify ground points}
+
+# Create function to be performed on each tile
+reclassify_ground <- function(las) {
   las <- readLAS(las)
   if (is.empty(las)) return(NULL)  
   l1 <- filter_poi(las, !Classification %in% c(0L, 2L))
@@ -67,118 +98,176 @@ ctg_fn <- function(las) {
   return(las)
 }
 
-class_out <- file.path("./02a_classified")
+# Create output directory
+class_out <- file.path("./03_classified")
 dir.create(class_out, showWarnings = FALSE)
 
+# Define catalog options
 opt_chunk_buffer(ctg) <- 10
 opt_output_files(ctg) <- file.path(class_out, "{*}")
 
 # Function is a memory hog, use only half the amount of cores to limit number
 # of tiles loaded in at once
-plan(multisession(workers = availableCores()/2))
 set_lidr_threads(1)
-ctg_cls <- catalog_apply(ctg, ctg_fn, .options = list(automerge = TRUE))
+plan(multisession(workers = availableCores() / 2))
+ctg_cls <- catalog_apply(ctg, reclassify_ground, .options = list(automerge = TRUE))
 plan(multisession)
 lidR:::catalog_laxindex(ctg_cls)
 
 ```
 
-Digital terrain/elevation model (DTM/DEM) generation: use tin algorithm. Luckily, the points are already classified and noise has been removed, so we can just run the algorithm!
+With the properly classified LAS tiles, we can now move on to DEM generation. There are a few different ways to go about this, but I chose using the TIN algorithm since it is commonly used and the default options are good for a wide variety of projects, so no algorithm tuning is necessary. The grid_terrain function loads surrounding tiles into memory when a given tile is loaded, so expect a large amount of memory to be used when generating the DEM. I ran into errors initially because of this, so I reduced the amount of cores allowed for processing, adjust to fit your machines needs.
 
-```{r}
+I chose to generate intermediate .tif files here since my machine crashed part way through, though this is optional. Temporary files can also be made without defining output locations for those, though user beware: if R crashes, this process needs to be restarted from the beginning.
 
-rast_out <- file.path("./03_dem_tiles")
+```{r DEM generation}
+
+# Define output location for each tile (can also omit this and generate temp files)
+rast_out <- file.path("./04_dem_tiles")
 dir.create(rast_out, showWarnings = FALSE)
 
 # Set catalog options
+ctg_cls <- readLAScatalog(class_out)
 opt_chunk_buffer(ctg_cls) <- 10
 opt_output_files(ctg_cls) <- file.path(rast_out, "{*}_dem")
 
-# Create function so that the output is not a large raster file
+# Generate DEM
 set_lidr_threads(1)
-plan(multisession(workers = availableCores()/2))
-dem_5cm <- grid_terrain(ctg_cls, res = 0.05, algorithm = tin())
+plan(multisession(workers = availableCores() / 2))
+dem <- grid_terrain(ctg_cls, res = map_res, algorithm = tin())
+
+# Write full raster to output folder
 plan(sequential)
-writeRaster(dem_5cm, file.path(prod_dir, "dem_5cm.tif"), overwrite = TRUE)
+writeRaster(dem, file.path(prod_dir, paste0("dem", res_txt, ".tif")), overwrite = TRUE)
 
 ```
 
-Now, produce DSM (don't need to normalize here)
+The same ideas used in DEM generation are also used for DSM generation. Again, temporary files can be made instead of the permanent .tif tiles, but use at your discretion.
 
-```{r}
+```{r DSM generation}
 
+# Define output location for each tile (can also omit this and generate temp files)
 dsm_dir <- file.path("./05_dsm_tiles")
 dir.create(dsm_dir, showWarnings = FALSE)
 
+# Set catalog options
 ctg_cls <- readLAScatalog(class_out)
 opt_chunk_buffer(ctg_cls) <- 10
 opt_output_files(ctg_cls) <- file.path(dsm_dir, "{*}_dsm")
 
-plan(multisession(workers = availableCores()/2))
+# Generate DSM
 set_lidr_threads(1)
+plan(multisession(workers = availableCores() / 2))
+dsm <- grid_canopy(ctg_cls, map_res, dsmtin())
 
-dsm <- grid_canopy(ctg_cls, 0.05, dsmtin())
+# Write full raster to output folder; DSM has holes
 plan(sequential)
-writeRaster(dsm, file.path(prod_dir, "dsm_5cm.tif"), overwrite = TRUE)
+writeRaster(dsm, file.path(prod_dir, paste0("dsm", res_txt, "_holes.tif")), overwrite = TRUE)
 
 ```
 
-Post-process the DSM and then Clip the DSM area to match the DEM
+The generated DSM has many holes in it. This is overcome by filling those holes (NA values) with mean values from surrounding cells in a 3x3 moving window. This action is completed using the `terra` package since it is much faster than the `raster` package. Additionally, triangulation created odd edge effects at the map boundaries, so those will get erased by masking with the DEM which does not have those edge effects.
 
-```{r}
+```{r DSM post processing}
 
-dem <- rast(file.path(prod_dir, "dem_5cm.tif"))
-dsm <- rast(file.path(prod_dir, "dsm_5cm.tif"))
+# Load the DEM and DSM in terra
+dem <- rast(file.path(prod_dir, paste0("dem", res_txt, ".tif")))
+dsm <- rast(file.path(prod_dir, paste0("dsm", res_txt, "_holes.tif")))
 
-fill.na <- function(x, i=5) { if (is.na(x)[i]) { return(mean(x, na.rm = TRUE)) } else { return(x[i]) }}
+# Create a fill function. This says "if the 5th cell in the moving window is NA,
+# replace it with the mean of all cells in that window that are not NA. If it is
+# not NA, ignore it.
+fill.na <- function(x, i = 5) { 
+  if (is.na(x)[i]) { 
+    return(mean(x, na.rm = TRUE)) 
+  } else { 
+    return(x[i]) 
+  }
+}
 w <- matrix(1, 3, 3)
 
-filled <- focal(dsm, w, fun = fill.na)
-# smoothed <- focal(chm, w, fun = mean, na.rm = TRUE)
+# Use focal function to fill NA values in the DSM
+dsm_filled <- focal(dsm, w, fun = fill.na)
 
-dsm_mask <- mask(filled, dem, filename = file.path(prod_dir, "dsm_5cm_clip.tif"), overwrite = TRUE)
-
-```
-
-
-For CHM, we need normalized LAS files - CHM not required so far...
-
-```{r}
-
-# norm_dir <- file.path("./04_normalized")
-# dir.create(norm_dir, showWarnings = FALSE)
-# 
-# ctg_cls <- readLAScatalog(class_out)
-# opt_chunk_buffer(ctg_cls) <- 10
-# opt_output_files(ctg_cls) <- file.path(norm_dir, "{*}")
-# 
-# plan(multisession(workers = 6))
-# set_lidr_threads(2)
-# ctg_norm <- normalize_height(ctg_cls, algorithm = tin(), Wdegenerated = FALSE)
-# lidR:::catalog_laxindex(ctg_norm)
+# Mask out the edges using the DEM, save the file on creation
+dsm_mask <- mask(dsm_filled, dem, filename = file.path(
+  prod_dir, paste0("dsm", res_txt, ".tif")), overwrite = TRUE)
 
 ```
 
-Now, create CHM
+That's it! Below is some masked code for generating normalized tiles for developing a CHM, though this is not required for this project. It follows the same principles as DSM generation, just using normalized tiles:
 
-```{r}
+1. Normalize the LAS tiles, save as new tiles
+2. Use triangulation to create the CHM (same method as DSM generation, but also have some masked code in case that turns out to not be appropriate)
+3. Fill NA values with mean of surrounding area.
 
-# ctg_norm <- readLAScatalog(norm_dir, filter = "-drop_z_below 0")
+Parallelizing is still a bit of a mystery to me, so I was playing around with different values trying some things out.
+
+```{r Normalize LAS tiles}
+
+# Define output location for normalized tiles
+norm_dir <- file.path("./06_normalized")
+dir.create(norm_dir, showWarnings = FALSE)
+
+# Set catalog options
+ctg_cls <- readLAScatalog(class_out)
+opt_chunk_buffer(ctg_cls) <- 10
+opt_output_files(ctg_cls) <- file.path(norm_dir, "{*}")
+
+# Generate normalized tiles
+set_lidr_threads(2)
+plan(multisession(workers = 6))
+ctg_norm <- normalize_height(ctg_cls, algorithm = tin(), Wdegenerated = FALSE)
+lidR:::catalog_laxindex(ctg_norm)
+
+```
+
+Now, create CHM. We can filter out points below 0 on the data load as these are errors. The CHM generated here uses the same ideas as the DSM generation, it's just performed on normalized tiles; however, code is provided to use the `pitfree()` algorithm as well. These should be compared, but it will take a long time to do so.
+
+```{r CHM generation}
+
+# Read the normalized tiles, drop points below 0
+ctg_norm <- readLAScatalog(norm_dir, filter = "-drop_z_below 0")
+
+# Define which algorithm to use: pitfree or dsmtin
 # max_z <- quantile(ctg_norm$Max.Z[-which.max(ctg_norm$Max.Z)], 0.9)
 # sq <- c(0, 2, seq(5, plyr::round_any(max_z, 5, ceiling), 5))
-# 
-# rast_out <- file.path("./05_dsm_tiles")
-# dir.create(rast_out, showWarnings = FALSE)
-# 
-# # Set catalog options
-# opt_chunk_buffer(ctg_norm) <- 10
-# opt_output_files(ctg_norm) <- file.path(rast_out, "{*}_dsm")
-# 
-# # Create function so that the output is not a large raster file
-# plan(multisession(workers = 6))
-# set_lidr_threads(2)
-# chm_5cm <- grid_canopy(ctg_norm, res = 0.05, algorithm = pitfree(sq, c(0, 0.5), subcircle = 0.025))
-# plan(sequential)
-# writeRaster(chm_5cm, file.path(prod_dir, "chm_5cm.tif"), overwrite = TRUE)
+# max_edge <- c(0, min(map_res * 10, 1))
+# subc <- map_res / 2
+
+# algo <- pitfree(thresholds = sq, max_edge = max_edge, subcircle = subc)
+algo <- dsmtin()
+
+# Define output location for raster tiles
+rast_out <- file.path("./07_chm_tiles")
+dir.create(rast_out, showWarnings = FALSE)
+
+# Set catalog options
+opt_chunk_buffer(ctg_norm) <- 10
+opt_output_files(ctg_norm) <- file.path(rast_out, "{*}_chm")
+
+# Generate CHM
+set_lidr_threads(2)
+plan(multisession(workers = 6))
+chm <- grid_canopy(ctg_norm, res = map_res, algorithm = algo)
+plan(sequential)
+writeRaster(chm, file.path(prod_dir, paste0("chm", res_txt, "_holes.tif")), overwrite = TRUE)
+
+```
+
+If filling NA values is necessary at this stage, run the fill.na function over the CHM with holes.
+
+```{r CHM post processing}
+
+# Load the DEM and CHM in terra
+dem <- rast(file.path(prod_dir, paste0("dem", res_txt, ".tif")))
+chm <- rast(file.path(prod_dir, paste0("chm", res_txt, "_holes.tif")))
+
+# Use focal function to fill NA values in the CHM, same function as with the DSM
+chm_filled <- focal(chm, w, fun = fill.na)
+
+# Mask out the edges using the DEM, save the file on creation
+chm_mask <- mask(chm_filled, dem, filename = file.path(
+  prod_dir, paste0("chm", res_txt, ".tif")), overwrite = TRUE)
 
 ```
