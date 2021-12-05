@@ -187,8 +187,20 @@ w <- matrix(1, 3, 3)
 # Use focal function to fill NA values in the DSM
 dsm_filled <- focal(dsm, w, fun = fill.na)
 
+# Match extents (crop to smallest one, this may not be the best but it works so far)
+dem_area <- expanse(as.polygons(ext(dem), crs = crs(dem)))
+dsm_area <- expanse(as.polygons(ext(dsm_filled), crs = crs(dsm_filled)))
+if(dem_area > dsm_area) {
+  dem <- crop(dem, dsm_filled)
+  dsm <- dsm_filled
+} else if(dem_area < dsm_area) {
+  dsm <- crop(dsm_filled, dem)
+} else {
+  dsm <- dsm_filled
+}
+
 # Mask out the edges using the DEM, save the file on creation
-dsm_mask <- mask(dsm_filled, dem, filename = file.path(
+dsm_mask <- mask(dsm, dem, filename = file.path(
   prod_dir, paste0("dsm", res_txt, ".tif")), overwrite = TRUE)
 
 ```
@@ -212,6 +224,7 @@ opt_output_files(ctg_cls) <- file.path(norm_dir, "{*}")
 set_lidr_threads(4)
 plan(multisession(workers = 3))
 ctg_norm <- normalize_height(ctg_cls, algorithm = tin(), Wdegenerated = FALSE)
+plan(multisession)
 lidR:::catalog_laxindex(ctg_norm)
 
 ```
@@ -249,6 +262,18 @@ If filling NA values is necessary at this stage, run the fill.na function over t
 
 ```{r CHM post processing}
 
+# Create a fill function. This says "if the 5th cell in the moving window is NA,
+# replace it with the mean of all cells in that window that are not NA. If it is
+# not NA, ignore it.
+fill.na <- function(x, i = 5) { 
+  if (is.na(x)[i]) { 
+    return(mean(x, na.rm = TRUE)) 
+  } else { 
+    return(x[i]) 
+  }
+}
+w <- matrix(1, 3, 3)
+
 # Load the DEM and CHM in terra
 dem <- rast(file.path(prod_dir, paste0("dem", res_txt, ".tif")))
 chm <- rast(file.path(prod_dir, paste0("chm", res_txt, "_holes.tif")))
@@ -256,8 +281,20 @@ chm <- rast(file.path(prod_dir, paste0("chm", res_txt, "_holes.tif")))
 # Use focal function to fill NA values in the CHM, same function as with the DSM
 chm_filled <- focal(chm, w, fun = fill.na)
 
+# Match extents (crop to smallest one, this may not be the best but it works so far)
+dem_area <- expanse(as.polygons(ext(dem), crs = crs(dem)))
+chm_area <- expanse(as.polygons(ext(chm_filled), crs = crs(chm_filled)))
+if(dem_area > chm_area) {
+  dem <- crop(dem, chm_filled)
+  chm <- chm_filled
+} else if(dem_area < chm_area) {
+  chm <- crop(chm_filled, dem)
+} else {
+  chm <- chm_filled
+}
+
 # Mask out the edges using the DEM, save the file on creation
-chm_mask <- mask(chm_filled, dem, filename = file.path(
+chm_mask <- mask(chm, dem, filename = file.path(
   prod_dir, paste0("chm", res_txt, ".tif")), overwrite = TRUE)
 
 ```
