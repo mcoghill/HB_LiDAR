@@ -13,6 +13,7 @@ The primary purpose of this file will be to process the downloaded LAS file into
 
 ```{r Load Libraries, include=FALSE}
 
+library(data.table)
 library(tidyverse)
 library(lidR)
 library(future)
@@ -20,6 +21,7 @@ library(terra)
 
 # Define desired resolution of the output map in meters
 map_res <- 0.05
+chm_fast <- TRUE
 
 # Create text string for file outputs
 res_txt <- if(map_res >= 1) {
@@ -32,93 +34,64 @@ res_txt <- if(map_res >= 1) {
 
 The first thing that needs to happen is tiling. The LAS file that I received was very large and difficult to work with on most machines. Tiling gets around that by breaking the large LAS file into many (36) smaller tiles. This helps to manage memory and increases efficiency since we can get machine cores working on each tile. If your machine has 16 cores, you can get a maximum of 16 tiles loaded and processed at once, but make sure to work within the limits of your machine since individual user experience will vary.
 
-The flow of this chunk is as follows:
-1. Define input and output directories. Create those if necessary.
-2. Use all cores of the machine to derive tiles from the original LAS file
-3. Define options for how the tiling will be performed, as well as output locations
-4. Perform tiling, when finished perform indexing by creating .lax files
+Tiling is able to happen by defining the chunk option `opt_chunk_size`, so it can happen as part of any LAS function. In this instance, I am going to reclassify ground points after a 250x250 m chunk is loaded. We will continue that in the next chunk, but in the chunk below we are just creating the directories for all of the outputs of this file.
 
 ```{r Tiling}
 
 # Define directories
 dl_dir <- file.path("./01_download_raw")
 tile_dir <- file.path("./02_tile")
-class_dir <- file.path("./03_classified")
-dem_dir <- file.path("./04_dem_tiles")
-dsm_dir <- file.path("./05_dsm_tiles")
-norm_dir <- file.path("./06_normalized")
-chm_dir <- file.path("./07_chm_tiles")
+dem_dir <- file.path("./03_dem_tiles")
+dsm_dir <- file.path("./04_dsm_tiles")
+norm_dir <- file.path("./05_normalized")
+chm_dir <- file.path("./06_chm_tiles")
 prod_dir <- file.path("./outputs")
 
 dir.create(tile_dir, showWarnings = FALSE)
-dir.create(class_dir, showWarnings = FALSE)
 dir.create(dem_dir, showWarnings = FALSE)
 dir.create(dsm_dir, showWarnings = FALSE)
 dir.create(norm_dir, showWarnings = FALSE)
 dir.create(chm_dir, showWarnings = FALSE)
 dir.create(prod_dir, showWarnings = FALSE)
 
-# Read large LAS file as a catalog
+```
+
+The original LAS file came with some amount of classification completed, but return numbers were a little bit off. Proper ground point classification uses the last returns from a given pulse to classify those points as "ground", but the LAS file that was generated had the "NumberOfReturns" value set to 4 for each point. This is incorrect: the number of returns should be the maximum value of the "ReturnNumber" for a given pulse, thus this requires that the LAS files be worked on:
+
+1. Retrieve a pulse ID for each point
+2. Group data by pulse ID
+3. Change the value in the "NumberOfReturns" column to be the maximum "ReturnNumber" in the data grouping
+4. Perform ground point classification using the cloth simulated filter (CSF) algorithm
+
+In doing so, ground point classification can be carried out with extreme accuracy without having to select different batches of points by classification numbers to operate on. Additionally, point indexation is supposed to assist in increasing processing time which is accomplished by creating .lax files. This step is completed by defining the output option "index" and changing it to `TRUE`. Finally, parallelizing is a bit of a mystery, but I found that using 4 for the lidR threads and 3 for the future cores seemed to do the trick for optimizing a timely delivery of products.
+
+```{r Reclassify ground points}
+
+reclassify_ground <- function(las) {
+  las <- readLAS(las)
+  if (is.empty(las)) return(NULL)
+  las <- retrieve_pulses(las)
+  las@data <- las@data[, NumberOfReturns:=max(ReturnNumber), by=pulseID]
+  las <- classify_ground(las, algorithm = csf(), last_returns = TRUE)
+  las <- filter_poi(las, buffer == 0)
+  return(las)
+}
+
+# Define catalog options
 las_file <- readUAVLAScatalog(dl_dir)
-
-# Set up machine cores for tiling
-set_lidr_threads(1)
-plan(multisession)
-
-# Catalog processing options
-opt_chunk_buffer(las_file) <- 0
+opt_chunk_buffer(las_file) <- 10
 opt_chunk_size(las_file) <- 250
 opt_output_files(las_file) <- file.path(tile_dir, "{XLEFT}_{YBOTTOM}")
 opt_chunk_alignment(las_file) <- c(
   plyr::round_any(xmin(las_file), 10, floor),
   plyr::round_any(ymin(las_file), 10, floor))
-
-# Perform tiling
-ctg <- catalog_retile(las_file)
-ctg <- readUAVLAScatalog(tile_dir)
-lidR:::catalog_laxindex(ctg)
-
-```
-
-The original LAS file came with some amount of classification completed, but ground point classification was not effectively done. I found this by creating and examining a DEM which had some rough points in some areas - the file itself is the result of merging 3 files together, so I'm not surprised that there were some issues. Ultimately, this requires ground point classification at this stage, but I don't want to interfere with the points already classified (not ground points), I just want to classify those that have already been ground classified and points that are unclassified, i.e.: point classifications 0 and 1 to classification 2. After classifying those points, they will be merged back together with the other classified points to recreate the full point cloud. This exercise assumes that the data has already been cleaned (confirmed by Richard).
-
-The overall steps include:
-
-1. Load in a LAS tile
-2. Separate the points that are classified as NOT 0's, 1's, or 2's from the LAS tile (l1)
-3. Separate the points that are classified as 0's, 1's, and 2's (l2)
-4. Reclassify all values in l2 to 1 (unclassified)
-5. Perform ground point classification on l2 using the cloth simulated filter (CSF)
-6. Merge l1 and l2 back together
-7. Save these tiles to a new folder
-
-I completed this using `lidR`'s catalog_apply() function application. This allows everything to be done efficiently in memory; however in doing so it becomes a memory hog on your machine. Monitor task manager and expect this to majorly impact usability on your PC while this and any other functions run. Other ways to do this include creating and saving separate LAS tiles for each step in this process, though this will eat up a lot of storage on your machine and will likely cost some amount of time for loading/saving each tile.
-
-```{r Reclassify ground points}
-
-reclassify_ground <- function(las) {
-  l1 <- readLAS(las) |> filter_poi(!Classification %in% c(0L, 1L, 2L))
-  l2 <- readLAS(las) |> filter_poi(Classification %in% c(0L, 1L, 2L))
-  if (is.empty(l1)|is.empty(l2)) return(NULL)
-  l2$Classification <- LASUNCLASSIFIED
-  l2 <- classify_ground(l2, algorithm = csf(), last_returns = FALSE)
-  l1 <- rbind(l1, l2)
-  l1 <- filter_poi(l1, buffer == 0)
-  return(l1)
-}
-
-# Define catalog options
-ctg <- readUAVLAScatalog(tile_dir)
-opt_chunk_buffer(ctg) <- 10
-opt_output_files(ctg) <- file.path(class_dir, "{*}")
+las_file@output_options$drivers$LAS$param$index <- TRUE
 
 # Function is a memory hog, use only half the amount of cores to limit number
 # of tiles loaded in at once
 set_lidr_threads(4)
 plan(multisession(workers = 3))
-ctg_cls <- catalog_apply(ctg, reclassify_ground, .options = list(automerge = TRUE))
-plan(multisession)
-lidR:::catalog_laxindex(ctg_cls)
+ctg <- catalog_apply(las_file, reclassify_ground, .options = list(automerge = TRUE))
 
 ```
 
@@ -129,14 +102,15 @@ I chose to generate intermediate .tif files here since my machine crashed part w
 ```{r DEM generation}
 
 # Set catalog options
-ctg_cls <- readUAVLAScatalog(class_dir, filter = "-keep_class 2 9")
-opt_chunk_buffer(ctg_cls) <- 10
-opt_output_files(ctg_cls) <- file.path(dem_dir, "{*}_dem")
+ctg <- readUAVLAScatalog(tile_dir, filter = "-keep_class 2 9")
+opt_chunk_buffer(ctg) <- 10
+opt_output_files(ctg) <- file.path(dem_dir, "{*}_dem")
+ctg@output_options$drivers$Raster$param$overwrite <- TRUE
 
 # Generate DEM
 set_lidr_threads(4)
 plan(multisession(workers = 3))
-dem <- grid_terrain(ctg_cls, res = map_res, algorithm = tin(), Wdegenerated = FALSE)
+dem <- grid_terrain(ctg, res = map_res, algorithm = tin(), Wdegenerated = FALSE)
 
 # Write full raster to output folder
 plan(sequential)
@@ -149,14 +123,15 @@ The same ideas used in DEM generation are also used for DSM generation. Again, t
 ```{r DSM generation}
 
 # Set catalog options
-ctg_cls <- readUAVLAScatalog(class_dir)
-opt_chunk_buffer(ctg_cls) <- 10
-opt_output_files(ctg_cls) <- file.path(dsm_dir, "{*}_dsm")
+ctg <- readUAVLAScatalog(tile_dir)
+opt_chunk_buffer(ctg) <- 10
+opt_output_files(ctg) <- file.path(dsm_dir, "{*}_dsm")
+ctg@output_options$drivers$Raster$param$overwrite <- TRUE
 
 # Generate DSM
 set_lidr_threads(4)
 plan(multisession(workers = 3))
-dsm <- grid_canopy(ctg_cls, map_res, dsmtin())
+dsm <- grid_canopy(ctg, map_res, dsmtin())
 
 # Write full raster to output folder; DSM has holes
 plan(sequential)
@@ -211,21 +186,18 @@ That's it! Below is some masked code for generating normalized tiles for develop
 2. Use triangulation to create the CHM (same method as DSM generation, but also have some masked code in case that turns out to not be appropriate)
 3. Fill NA values with mean of surrounding area.
 
-Parallelizing is still a bit of a mystery to me, so I was playing around with different values trying some things out.
-
 ```{r Normalize LAS tiles}
 
 # Set catalog options
-ctg_cls <- readUAVLAScatalog(class_dir)
-opt_chunk_buffer(ctg_cls) <- 10
-opt_output_files(ctg_cls) <- file.path(norm_dir, "{*}")
+ctg <- readUAVLAScatalog(tile_dir)
+opt_chunk_buffer(ctg) <- 10
+opt_output_files(ctg) <- file.path(norm_dir, "{*}")
+ctg@output_options$drivers$LAS$param$index <- TRUE
 
 # Generate normalized tiles
 set_lidr_threads(4)
 plan(multisession(workers = 3))
-ctg_norm <- normalize_height(ctg_cls, algorithm = tin(), Wdegenerated = FALSE)
-plan(multisession)
-lidR:::catalog_laxindex(ctg_norm)
+ctg_norm <- normalize_height(ctg, algorithm = tin(), Wdegenerated = FALSE)
 
 ```
 
@@ -237,17 +209,20 @@ Now, create CHM. We can filter out points below 0 on the data load as these are 
 ctg_norm <- readUAVLAScatalog(norm_dir, filter = "-drop_z_below 0")
 
 # Define which algorithm to use: pitfree or dsmtin
-# max_z <- mean(ctg_norm$Max.Z)
-# sq <- c(0, 2, seq(5, plyr::round_any(max_z, 5, ceiling), 5))
-# max_edge <- c(0, min(map_res * 10, 1))
-# subc <- map_res / 2
-# 
-# algo <- pitfree(thresholds = sq, max_edge = max_edge, subcircle = subc)
-algo <- dsmtin()
+if(chm_fast) {
+  algo <- dsmtin()
+} else {
+  max_z <- mean(ctg_norm$Max.Z)
+  sq <- c(0, 2, seq(5, plyr::round_any(max_z, 5, ceiling), 5))
+  max_edge <- c(0, min(map_res * 10, 1))
+  subc <- map_res / 2
+  algo <- pitfree(thresholds = sq, max_edge = max_edge, subcircle = subc)
+}
 
 # Set catalog options
 opt_chunk_buffer(ctg_norm) <- 10
 opt_output_files(ctg_norm) <- file.path(chm_dir, "{*}_chm")
+ctg_norm@output_options$drivers$Raster$param$overwrite <- TRUE
 
 # Generate CHM
 set_lidr_threads(4)
@@ -258,7 +233,7 @@ writeRaster(chm, file.path(prod_dir, paste0("chm", res_txt, "_holes.tif")), over
 
 ```
 
-If filling NA values is necessary at this stage, run the fill.na function over the CHM with holes.
+Run the fill.na function over the CHM with holes.
 
 ```{r CHM post processing}
 
