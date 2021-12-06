@@ -41,3 +41,4 @@ rsconnect/
 *.lax
 *.tif
 *.vrt
+*.gpkg
