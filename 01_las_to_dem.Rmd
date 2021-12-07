@@ -76,27 +76,33 @@ reclassify_ground <- function(las, update_bound = FALSE) {
   las <- retrieve_pulses(las)
   las@data <- las@data[, NumberOfReturns:=max(ReturnNumber), by=pulseID]
   las <- classify_ground(las, algorithm = csf(sloop_smooth = TRUE), last_returns = TRUE)
-  if(update_bound | !file.exists(file.path(prod_dir, "shape_raw.gpkg"))) {
-    hull <- concaveman(las$X, las$Y, concavity = 1, length_threshold = 5)
-    hull <- st_sfc(st_polygon(list(as.matrix(hull))), crs = wkt(las))
-    st_write(hull, file.path(prod_dir, "shape_raw.gpkg"), append = TRUE, quiet = TRUE)
-  }
+  # if(update_bound | !file.exists(file.path(prod_dir, "shape_raw.gpkg"))) {
+  #   hull <- concaveman(las$X, las$Y, concavity = 1, length_threshold = 5)
+  #   hull <- st_sfc(st_polygon(list(as.matrix(hull))), crs = wkt(las))
+  #   st_write(hull, file.path(prod_dir, "shape_raw.gpkg"), append = TRUE, quiet = TRUE)
+  # }
   las <- filter_poi(las, buffer == 0)
   return(las)
 }
 
 # Define catalog options
 las_file <- readUAVLAScatalog(dl_dir)
-opt_chunk_buffer(las_file) <- 12.5
-opt_chunk_size(las_file) <- 250
+n_chunks_wide <- 6
+n_chunks_tall <- 6
+las_width <- ceiling(xmax(las_file)) - floor(xmin(las_file))
+las_height <- ceiling(ymax(las_file)) - floor(ymin(las_file))
+opt_chunk_size(las_file) <- max(c(las_width / n_chunks_wide, las_height / n_chunks_tall))
+opt_chunk_buffer(las_file) <- plyr::round_any(opt_chunk_size(las_file) * 0.1, 0.5, ceiling)
 opt_output_files(las_file) <- file.path(tile_dir, "{XLEFT}_{YBOTTOM}")
 opt_chunk_alignment(las_file) <- c(
-  plyr::round_any(xmin(las_file), 10, floor),
-  plyr::round_any(ymin(las_file), 10, floor))
+  floor(xmin(las_file) + las_width / 2),
+  floor(ymin(las_file) + las_height / 2)
+)
 las_file@output_options$drivers$LAS$param$index <- TRUE
+plot(las_file, chunk_pattern = TRUE)
 
 # Run the function
-set_lidr_threads(4)
+set_lidr_threads(2)
 plan(multisession(workers = 3))
 ctg <- catalog_apply(las_file, reclassify_ground, .options = list(automerge = TRUE))
 
@@ -122,7 +128,7 @@ ctg@output_options$drivers$Raster$param$overwrite <- TRUE
 
 # Generate DEM
 set_lidr_threads(4)
-plan(multisession(workers = 3))
+plan(multisession(workers = 2))
 dem <- rast(grid_terrain(ctg, res = map_res, algorithm = tin(), Wdegenerated = FALSE))
 
 # Write full raster to output folder
