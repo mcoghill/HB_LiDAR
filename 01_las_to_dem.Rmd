@@ -9,7 +9,9 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-The primary purpose of this file will be to process the downloaded LAS file into raster products (DEM and DSM). First, core libraries need to be loaded. We will also define our output map resolution here in meters.
+The primary purpose of this file will be to process the downloaded LAS file into raster products (DEM and DSM). First, core libraries need to be loaded. We will also define our output map resolution here in meters. 
+
+It should also be noted here that this process was completed using a computer with 16 cores and 32GB of RAM. Functions have been optimized in this script to use that setup, so for the functions `set_lidr_threads()` and `plan(multisession, workers = x)`, adjust for your PC as necessary. Remember: for functions that are natively parallel, favor cores for the `set_lidr_threads()` function; for those that are not natively parallel, favor chunk based parallelism using `plan(multisession)`. The numbers you can use can only be multiples of your total machine cores. For example, with a machine with 16 cores you can have it set up using 1 and 16, 2 and 8, 3 and 5, and 4 and 4. Exceeding these may cause issues, but the `lidR` package should favor chunk based parallelism in that case.
 
 ```{r Load Libraries, include=FALSE}
 
@@ -230,8 +232,8 @@ opt_output_files(ctg) <- file.path(norm_dir, "{*}")
 ctg@output_options$drivers$LAS$param$index <- TRUE
 
 # Generate normalized tiles
-set_lidr_threads(4L)
-plan(multisession, workers = 4L)
+set_lidr_threads(8L)
+plan(multisession, workers = 2L)
 ctg_norm <- normalize_height(ctg, algorithm = tin(), Wdegenerated = FALSE)
 
 ```
